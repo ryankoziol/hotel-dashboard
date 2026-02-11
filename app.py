@@ -21,12 +21,11 @@ import openai
 st.set_page_config(page_title="Reputation Dashboard", page_icon="🏨", layout="wide", initial_sidebar_state="collapsed")
 load_dotenv()
 
-# [FIX 1] PRIORITY SECRETS LOADING (For Cloud Stability)
-# Checks Streamlit Cloud secrets first, falls back to .env for local testing
+# [FIX] PRIORITY SECRETS LOADING (Cloud Stability)
 def get_secret(key):
     if key in st.secrets:
-        return st.secrets[key]
-    return os.getenv(key, "")
+        return st.secrets[key].strip()
+    return os.getenv(key, "").strip()
 
 SERPAPI_KEY = get_secret("SERPAPI_KEY")
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
@@ -43,15 +42,16 @@ ACTIVITY_FILE = "data/activity_log.csv"
 
 TTL_DAYS = 14
 
-# --- [FIX 2] NULL-SAFETY HELPER FUNCTIONS ---
-# These prevent the "int + NoneType" crashes by forcing valid numbers
+# --- [FIX] SAFETY HELPER FUNCTIONS ---
 def safe_float(val):
+    """Prevents crashes by forcing empty/None values to 0.0"""
     try:
         if pd.isna(val) or val == "" or val is None: return 0.0
         return float(val)
     except: return 0.0
 
 def safe_int(val):
+    """Prevents crashes by forcing empty/None values to 0"""
     try:
         if pd.isna(val) or val == "" or val is None: return 0
         return int(float(val))
@@ -481,26 +481,33 @@ def scan_organic_results(results, out, debug_notes, snippet_collection):
                 if reviews: out["Expedia_N"] = reviews
 
 def fetch_data(name, city, state, debug_mode):
+    # [FIX] STRING CONVERSION: Ensures we never process a float/NaN as text
+    s_name = str(name)
+    s_city = str(city)
+    s_state = str(state)
+
     out = {
-        "Name": name, "City": city, "State": state, 
+        "Name": s_name, "City": s_city, "State": s_state, 
         "Google_Raw": None, "Google_N": None,
         "TA_Raw": None, "TA_N": None,
         "Expedia_Raw": None, "Expedia_N": None,
         "Booking_Raw": None, "Booking_N": None,
         "Review_Text_Raw": "",
         "Is_Verified": False,
-        "_resolved_name": name,
+        "_resolved_name": s_name,
         "Debug": ""
     }
     debug_notes = []
     snippet_collection = []
 
-    clean_name = str(name).replace("[", "").replace("]", "").strip()
+    clean_name = s_name.replace("[", "").replace("]", "").strip()
     
-    # ATTEMPT 1: SPECIFIC SEARCH
+    # [FIX] SMART SEARCH: IGNORE "Unknown" STATE
+    # If state is "Unknown" (e.g. Nassau), don't add it to the search string
     loc_str = ""
-    if "Pending" not in city and city != "Unknown": loc_str += city + " "
-    if "Pending" not in state and state != "Unknown": loc_str += state
+    if "Pending" not in s_city and s_city != "Unknown": loc_str += s_city + " "
+    if "Pending" not in s_state and s_state != "Unknown": loc_str += s_state
+    
     loc_str = loc_str.strip()
     query_1 = f"{clean_name} {loc_str} hotel reviews".strip()
 
@@ -547,11 +554,13 @@ def fetch_data(name, city, state, debug_mode):
 
     # SEARCH 2 & 3: Sniper
     search_name = out["_resolved_name"]
-    loc_str = f"{out['City']} {out['State']}".replace("Pending", "").strip()
+    # Re-apply Smart Search logic for sniper
+    loc_str_snip = f"{out['City']} {out['State']}".replace("Pending", "").replace("Unknown", "").strip()
+    
     targets = [("Booking", "booking.com", "Booking_Raw"), ("Expedia", "expedia.com", "Expedia_Raw"), ("TA", "tripadvisor.com", "TA_Raw")]
     for ota_name, domain, key in targets:
         if not out[key]:
-            q_sniper = f"{search_name} {loc_str} reviews {domain}".strip()
+            q_sniper = f"{search_name} {loc_str_snip} reviews {domain}".strip()
             try:
                 search_t = GoogleSearch({"engine": "google", "q": q_sniper, "api_key": SERPAPI_KEY, "num": 5})
                 res_t = search_t.get_dict()
@@ -930,17 +939,33 @@ property on your list, which will consume new API credits.""")
                     if 'Name' not in df.columns:
                         st.error("File missing 'Name' column.")
                         return
+                        
+                    # [FIX] SANITIZATION: Force fill blanks to prevent crashes
                     if 'City' not in df.columns: df['City'] = 'Unknown'
                     if 'State' not in df.columns: df['State'] = 'Unknown'
-                    df['Hotel_ID'] = df['Name'].astype(str) + "_" + df['City'].astype(str) + "_" + df['State'].astype(str)
+                    
+                    # Ensure they are strings, not NaNs
+                    df['City'] = df['City'].fillna('Unknown').astype(str)
+                    df['State'] = df['State'].fillna('Unknown').astype(str)
+                    df['Name'] = df['Name'].fillna('Unknown').astype(str)
+                    
+                    df['Hotel_ID'] = df['Name'] + "_" + df['City'] + "_" + df['State']
                     df['Is_Verified'] = False
                     cols = ['Name', 'City', 'State', 'Hotel_ID', 'Is_Verified']
-                    # Keep URL support in BULK uploads only if column exists
+                    
                     if 'Url' in df.columns: df['URL'] = df['Url']; cols.append('URL')
                     elif 'URL' in df.columns: cols.append('URL')
                     
                     clean_df = df[cols].copy()
                     st.session_state['working_df'] = pd.concat([st.session_state['working_df'], clean_df], ignore_index=True).drop_duplicates(subset=['Hotel_ID'])
+                    
+                    # [FIX] HEALTH CHECK WARNING
+                    bad_rows = clean_df[clean_df['State'] == 'Unknown'].index.tolist()
+                    if bad_rows:
+                        # Convert 0-based index to 1-based row number (accounting for header)
+                        row_nums = [x + 2 for x in bad_rows]
+                        st.warning(f"⚠️ **Data Quality Warning:** {len(bad_rows)} rows are missing 'State' data (Excel Rows: {row_nums[:5]}...). Results may be less accurate.")
+                    
                     st.toast("✅ Hotel(s) added to queue.")
                 except Exception as e: st.error(f"Error: {e}")
 
@@ -956,13 +981,17 @@ property on your list, which will consume new API credits.""")
                 with c1: f_name = st.text_input("Name", placeholder="Name")
                 with c2: f_city = st.text_input("City", placeholder="City")
                 with c3: f_state = st.text_input("State", placeholder="TX")
-                if st.form_submit_button("Add") and f_name:
-                    st.session_state['working_df'] = pd.concat([st.session_state['working_df'], pd.DataFrame([{
-                        'Name': f_name, 'City': f_city, 'State': f_state if f_state else "Unknown", 
-                        'Hotel_ID': f"{f_name}_{f_city}_{f_state}", 'Is_Verified': False
-                    }])], ignore_index=True)
-                    st.toast("✅ Hotel added to queue.")
-                    st.rerun()
+                if st.form_submit_button("Add"):
+                    # [FIX] STRICT MANUAL ENTRY: Require all 3 fields
+                    if f_name and f_city and f_state:
+                        st.session_state['working_df'] = pd.concat([st.session_state['working_df'], pd.DataFrame([{
+                            'Name': f_name, 'City': f_city, 'State': f_state, 
+                            'Hotel_ID': f"{f_name}_{f_city}_{f_state}", 'Is_Verified': False
+                        }])], ignore_index=True)
+                        st.toast("✅ Hotel added to queue.")
+                        st.rerun()
+                    else:
+                        st.error("⚠️ Please fill in all 3 fields (Name, City, State).")
 
         if not st.session_state['working_df'].empty:
             st.markdown("---")
@@ -1134,8 +1163,7 @@ property on your list, which will consume new API credits.""")
             # Display table (Non-editable view unless toggle is on)
             if not enable_edit:
                 display_cols = [c for c in final_df.columns if c not in ["Google Score", "Expedia Score", "TripAdvisor Score", "Booking Score", "Matched Name (Source)"]]
-                
-                # [FIX] Added na_rep="-" to prevent styling crash on None values
+                # [FIX] NULL-SAFE STYLING: na_rep="-" prevents crashes on empty cells
                 st.dataframe(final_df[display_cols].style.format(fmt, na_rep="-").apply(highlight_total_row, axis=1), use_container_width=True, hide_index=True)
 
             # --- METHODOLOGY BOX (RESTORED HERE) ---
