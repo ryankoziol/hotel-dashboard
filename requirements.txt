@@ -1,0 +1,8 @@
+streamlit
+pandas
+altair
+python-dotenv
+google-search-results
+openai
+openpyxl
+requests
