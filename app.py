@@ -21,8 +21,15 @@ import openai
 st.set_page_config(page_title="Reputation Dashboard", page_icon="🏨", layout="wide", initial_sidebar_state="collapsed")
 load_dotenv()
 
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# [FIX 1] PRIORITY SECRETS LOADING (For Cloud Stability)
+# Checks Streamlit Cloud secrets first, falls back to .env for local testing
+def get_secret(key):
+    if key in st.secrets:
+        return st.secrets[key]
+    return os.getenv(key, "")
+
+SERPAPI_KEY = get_secret("SERPAPI_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 
 # -- FILE PATHS --
 if not os.path.exists("data"):
@@ -35,6 +42,20 @@ HISTORY_FILE = "data/history.csv"
 ACTIVITY_FILE = "data/activity_log.csv"
 
 TTL_DAYS = 14
+
+# --- [FIX 2] NULL-SAFETY HELPER FUNCTIONS ---
+# These prevent the "int + NoneType" crashes by forcing valid numbers
+def safe_float(val):
+    try:
+        if pd.isna(val) or val == "" or val is None: return 0.0
+        return float(val)
+    except: return 0.0
+
+def safe_int(val):
+    try:
+        if pd.isna(val) or val == "" or val is None: return 0
+        return int(float(val))
+    except: return 0
 
 # --- CUSTOM CSS ---
 st.markdown("""
@@ -300,10 +321,10 @@ def log_history(email, group_name, df_results):
     weighted_sum = 0
     if "Weighted Avg. Review Score" in df_clean.columns:
         for _, row in df_clean.iterrows():
-            revs = (row.get("# Google Reviews", 0) + row.get("# Expedia Reviews", 0) + 
-                   row.get("# TripAdvisor Reviews", 0) + row.get("# Booking Reviews", 0))
-            score = row.get("Weighted Avg. Review Score", 0)
-            if revs > 0 and pd.notnull(score):
+            revs = (safe_int(row.get("# Google Reviews")) + safe_int(row.get("# Expedia Reviews")) + 
+                    safe_int(row.get("# TripAdvisor Reviews")) + safe_int(row.get("# Booking Reviews")))
+            score = safe_float(row.get("Weighted Avg. Review Score"))
+            if revs > 0 and score > 0:
                 weighted_sum += (score * revs)
                 total_reviews += revs
     
@@ -391,11 +412,11 @@ def find_header_row(uploaded_file, file_type='csv'):
     return header_idx if found else 0
 
 def normalize_to_10(val, scale=5):
-    try:
-        v = float(val)
-        if scale == 5: return round(v * 2, 1)
-        return round(v, 1)
-    except: return None
+    # [FIX] Use safe_float to handle None
+    v = safe_float(val)
+    if v == 0 and (val is None or pd.isna(val)): return None
+    if scale == 5: return round(v * 2, 1)
+    return round(v, 1)
 
 def extract_rating_from_text(text):
     if not text: return None, None
@@ -548,10 +569,10 @@ def calculate_metrics(row):
     row["Google_10"] = normalize_to_10(row["Google_Raw"], 5)
     row["TA_10"] = normalize_to_10(row["TA_Raw"], 5)
     for k in ["Booking", "Expedia"]:
-        v = row[f"{k}_Raw"]
-        if v:
-            fv = float(v)
-            row[f"{k}_10"] = fv if fv > 5 else normalize_to_10(fv, 5)
+        # [FIX] Safe float conversion
+        v = safe_float(row[f"{k}_Raw"])
+        if v > 0:
+            row[f"{k}_10"] = v if v > 5 else normalize_to_10(v, 5)
         else: row[f"{k}_10"] = None
 
     total_score = 0
@@ -559,13 +580,10 @@ def calculate_metrics(row):
     platforms = [("Google", 5), ("TA", 5), ("Expedia", 5), ("Booking", 10)] 
     
     for plt, _ in platforms:
-        score_10 = row.get(f"{plt}_10")
-        count = row.get(f"{plt}_N")
-        if count:
-            try: count = int(count)
-            except: count = 0
-        else: count = 0
-        if score_10 is not None and count > 0:
+        score_10 = safe_float(row.get(f"{plt}_10"))
+        count = safe_int(row.get(f"{plt}_N"))
+        
+        if score_10 > 0 and count > 0:
             total_score += (score_10 * count)
             total_count += count
             
@@ -575,6 +593,7 @@ def calculate_metrics(row):
     return row
 
 def calculate_portfolio_averages(df):
+    # [FIX] Complete Rewrite for Null Safety - Fixes TypeError crash
     if df.empty: return None
     summary = {"Name": "Total / Weighted Average", "City": "-", "State": "-", "Last Scraped": datetime.now().strftime("%Y-%m-%d")}
     platforms = ["Google", "Expedia", "TripAdvisor", "Booking"]
@@ -582,7 +601,8 @@ def calculate_portfolio_averages(df):
     for plt in platforms:
         col_name = f"# {plt} Reviews"
         if col_name in df.columns:
-            total = df[col_name].sum()
+            # Use safe_int to handle any NaNs in the column
+            total = df[col_name].apply(safe_int).sum()
             summary[col_name] = int(total)
     
     for plt in platforms:
@@ -594,9 +614,9 @@ def calculate_portfolio_averages(df):
             weighted_sum = 0
             total_count = 0
             for _, row in df.iterrows():
-                s = row.get(score_col)
-                c = row.get(count_col)
-                if pd.notnull(s) and pd.notnull(c) and c > 0:
+                s = safe_float(row.get(score_col))
+                c = safe_int(row.get(count_col))
+                if s > 0 and c > 0:
                     weighted_sum += (s * c)
                     total_count += c
             summary[score_col] = round(weighted_sum / total_count, 1) if total_count > 0 else None
@@ -605,9 +625,9 @@ def calculate_portfolio_averages(df):
             weighted_sum = 0
             total_count = 0
             for _, row in df.iterrows():
-                s = row.get(norm_col)
-                c = row.get(count_col)
-                if pd.notnull(s) and pd.notnull(c) and c > 0:
+                s = safe_float(row.get(norm_col))
+                c = safe_int(row.get(count_col))
+                if s > 0 and c > 0:
                     weighted_sum += (s * c)
                     total_count += c
             summary[norm_col] = round(weighted_sum / total_count, 1) if total_count > 0 else None
@@ -617,9 +637,12 @@ def calculate_portfolio_averages(df):
         total_revs = 0
         for _, row in df.iterrows():
             row_revs = 0
-            for plt in platforms: row_revs += row.get(f"# {plt} Reviews", 0)
-            w_avg = row.get("Weighted Avg. Review Score")
-            if pd.notnull(w_avg) and row_revs > 0:
+            for plt in platforms: 
+                # [FIX] safe_int here prevents the "int + NoneType" crash
+                row_revs += safe_int(row.get(f"# {plt} Reviews"))
+            
+            w_avg = safe_float(row.get("Weighted Avg. Review Score"))
+            if w_avg > 0 and row_revs > 0:
                 weighted_sum += (w_avg * row_revs)
                 total_revs += row_revs
         summary["Weighted Avg. Review Score"] = round(weighted_sum / total_revs, 1) if total_revs > 0 else None
@@ -631,7 +654,7 @@ def calculate_portfolio_averages(df):
 # ---------------------------
 def generate_portfolio_summary(data_df):
     if not OPENAI_API_KEY:
-        return "⚠️ API Key Missing. Please add OPENAI_API_KEY to your .env file."
+        return "⚠️ API Key Missing. Please add OPENAI_API_KEY to your Secrets."
     
     if data_df.empty:
         return "No data available to analyze."
@@ -640,7 +663,7 @@ def generate_portfolio_summary(data_df):
     internal_vol_cols = ['Google_N', 'Expedia_N', 'TA_N', 'Booking_N']
     for vc in internal_vol_cols:
         if vc not in data_df.columns: data_df[vc] = 0
-        else: data_df[vc] = data_df[vc].fillna(0).astype(int)
+        else: data_df[vc] = data_df[vc].apply(safe_int)
             
     total_reviews_all = int(data_df[internal_vol_cols].sum().sum())
     hotel_count = len(data_df)
@@ -649,9 +672,9 @@ def generate_portfolio_summary(data_df):
     w_vol = 0
     if "Weighted_Avg" in data_df.columns:
         for _, r in data_df.iterrows():
-            row_vol = sum(r.get(vc, 0) for vc in internal_vol_cols)
-            score = r.get("Weighted_Avg")
-            if pd.notnull(score) and row_vol > 0:
+            row_vol = sum(safe_int(r.get(vc)) for vc in internal_vol_cols)
+            score = safe_float(r.get("Weighted_Avg"))
+            if score > 0 and row_vol > 0:
                 w_sum += (score * row_vol)
                 w_vol += row_vol
     overall_score = round(w_sum / w_vol, 1) if w_vol > 0 else 0
@@ -672,9 +695,11 @@ def generate_portfolio_summary(data_df):
     # GEO BREAKDOWN (PRE-CALC)
     geo_stats = "N/A"
     if 'State' in data_df.columns:
-        best_state = data_df.groupby('State')['Weighted_Avg'].mean().idxmax()
-        worst_state = data_df.groupby('State')['Weighted_Avg'].mean().idxmin()
-        geo_stats = f"Best Performing Region: {best_state}, Lowest Performing: {worst_state}"
+        try:
+            best_state = data_df.groupby('State')['Weighted_Avg'].mean().idxmax()
+            worst_state = data_df.groupby('State')['Weighted_Avg'].mean().idxmin()
+            geo_stats = f"Best Performing Region: {best_state}, Lowest Performing: {worst_state}"
+        except: geo_stats = "Insufficient Data"
 
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     
@@ -1109,7 +1134,9 @@ property on your list, which will consume new API credits.""")
             # Display table (Non-editable view unless toggle is on)
             if not enable_edit:
                 display_cols = [c for c in final_df.columns if c not in ["Google Score", "Expedia Score", "TripAdvisor Score", "Booking Score", "Matched Name (Source)"]]
-                st.dataframe(final_df[display_cols].style.format(fmt).apply(highlight_total_row, axis=1), use_container_width=True, hide_index=True)
+                
+                # [FIX] Added na_rep="-" to prevent styling crash on None values
+                st.dataframe(final_df[display_cols].style.format(fmt, na_rep="-").apply(highlight_total_row, axis=1), use_container_width=True, hide_index=True)
 
             # --- METHODOLOGY BOX (RESTORED HERE) ---
             with st.expander("Methodology & Assumptions", expanded=False):
@@ -1205,9 +1232,10 @@ property on your list, which will consume new API credits.""")
             w_sum = 0
             total_vol = 0
             for _, r in curr_calc.iterrows():
-                revs = (r.get('Google_N', 0) or 0) + (r.get('Expedia_N', 0) or 0) + (r.get('TA_N', 0) or 0) + (r.get('Booking_N', 0) or 0)
-                w_avg = r.get('Weighted_Avg')
-                if pd.notnull(w_avg) and revs > 0:
+                revs = (safe_int(r.get('Google_N')) + safe_int(r.get('Expedia_N')) + 
+                        safe_int(r.get('TA_N')) + safe_int(r.get('Booking_N')))
+                w_avg = safe_float(r.get('Weighted_Avg'))
+                if w_avg > 0 and revs > 0:
                     w_sum += (w_avg * revs)
                     total_vol += int(revs)
             port_score = round(w_sum / total_vol, 1) if total_vol > 0 else 0
@@ -1227,8 +1255,9 @@ property on your list, which will consume new API credits.""")
             def calc_plat_stats(key_norm, key_n):
                 p_w_sum = 0; p_vol = 0
                 for _, r in curr_calc.iterrows():
-                    s = r.get(key_norm); c = r.get(key_n) or 0
-                    if pd.notnull(s) and c > 0:
+                    s = safe_float(r.get(key_norm))
+                    c = safe_int(r.get(key_n))
+                    if s > 0 and c > 0:
                         p_w_sum += (s * c)
                         p_vol += c
                 return (round(p_w_sum / p_vol, 1) if p_vol > 0 else 0), int(p_vol)
@@ -1336,9 +1365,9 @@ property on your list, which will consume new API credits.""")
             for loc, group in curr_calc.groupby([group_by]):
                 state_w_sum = 0; state_vol = 0
                 for _, r in group.iterrows():
-                    revs = (r.get('Google_N', 0) or 0) + (r.get('Expedia_N', 0) or 0) + (r.get('TA_N', 0) or 0) + (r.get('Booking_N', 0) or 0)
-                    w_avg = r.get('Weighted_Avg')
-                    if pd.notnull(w_avg) and revs > 0: state_w_sum += (w_avg * revs); state_vol += revs
+                    revs = (safe_int(r.get('Google_N')) + safe_int(r.get('Expedia_N')) + safe_int(r.get('TA_N')) + safe_int(r.get('Booking_N')))
+                    w_avg = safe_float(r.get('Weighted_Avg'))
+                    if w_avg > 0 and revs > 0: state_w_sum += (w_avg * revs); state_vol += revs
                 geo_score = round(state_w_sum / state_vol, 1) if state_vol > 0 else 0
                 clean_loc = str(loc).replace("('", "").replace("',)", "").replace("[", "").replace("]", "")
                 geo_rows.append({group_by: clean_loc, "Hotels": len(group), "Reviews": state_vol, "Score": geo_score})
