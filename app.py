@@ -502,8 +502,7 @@ def fetch_data(name, city, state, debug_mode):
 
     clean_name = s_name.replace("[", "").replace("]", "").strip()
     
-    # [FIX] SMART SEARCH: IGNORE "Unknown" STATE
-    # If state is "Unknown" (e.g. Nassau), don't add it to the search string
+    # [FIX] SMART SEARCH: IGNORE "Unknown" STATE & CITY
     loc_str = ""
     if "Pending" not in s_city and s_city != "Unknown": loc_str += s_city + " "
     if "Pending" not in s_state and s_state != "Unknown": loc_str += s_state
@@ -924,6 +923,7 @@ property on your list, which will consume new API credits.""")
     with tab_live:
         col_upload, col_input = st.columns([1, 1], gap="large")
         
+        # [FIX] COMPREHENSIVE DATA AUDIT & SANITIZATION
         def process_file_upload():
             uploaded_file = st.session_state.get('file_uploader')
             if uploaded_file is not None:
@@ -936,19 +936,49 @@ property on your list, which will consume new API credits.""")
                         df = pd.read_excel(uploaded_file, header=header_idx)
                     
                     df.columns = df.columns.str.strip().str.title()
+                    
+                    # 1. Sanitize: Fill blanks with 'Unknown'
                     if 'Name' not in df.columns:
                         st.error("File missing 'Name' column.")
                         return
-                        
-                    # [FIX] SANITIZATION: Force fill blanks to prevent crashes
+                    
                     if 'City' not in df.columns: df['City'] = 'Unknown'
                     if 'State' not in df.columns: df['State'] = 'Unknown'
                     
-                    # Ensure they are strings, not NaNs
+                    df['Name'] = df['Name'].fillna('Unknown').astype(str)
                     df['City'] = df['City'].fillna('Unknown').astype(str)
                     df['State'] = df['State'].fillna('Unknown').astype(str)
-                    df['Name'] = df['Name'].fillna('Unknown').astype(str)
                     
+                    # 2. Audit: Check for specific failures
+                    warnings = []
+                    
+                    # A. Fatal: Missing Name (Skip these rows)
+                    missing_name_mask = (df['Name'] == 'Unknown') | (df['Name'].str.strip() == '')
+                    skipped_count = missing_name_mask.sum()
+                    if skipped_count > 0:
+                        warnings.append(f"Skipped {skipped_count} rows missing 'Name' data.")
+                        df = df[~missing_name_mask].copy() # Filter them out
+                    
+                    if df.empty:
+                        st.warning("⚠️ No valid rows found after filtering missing names.")
+                        return
+
+                    # B. Warning: Missing City or State
+                    missing_city = df[df['City'] == 'Unknown'].index.tolist()
+                    missing_state = df[df['State'] == 'Unknown'].index.tolist()
+                    
+                    if missing_city:
+                        rows_disp = [x + header_idx + 2 for x in missing_city][:5] # +2 accounts for 0-index and header
+                        warnings.append(f"{len(missing_city)} rows missing 'City' (e.g. Row {rows_disp}...)")
+                    
+                    if missing_state:
+                        rows_disp = [x + header_idx + 2 for x in missing_state][:5]
+                        warnings.append(f"{len(missing_state)} rows missing 'State' (e.g. Row {rows_disp}...)")
+                    
+                    if warnings:
+                        st.warning("⚠️ **Data Quality Report:** " + " | ".join(warnings))
+                    
+                    # 3. Construct ID and proceed
                     df['Hotel_ID'] = df['Name'] + "_" + df['City'] + "_" + df['State']
                     df['Is_Verified'] = False
                     cols = ['Name', 'City', 'State', 'Hotel_ID', 'Is_Verified']
@@ -959,14 +989,7 @@ property on your list, which will consume new API credits.""")
                     clean_df = df[cols].copy()
                     st.session_state['working_df'] = pd.concat([st.session_state['working_df'], clean_df], ignore_index=True).drop_duplicates(subset=['Hotel_ID'])
                     
-                    # [FIX] HEALTH CHECK WARNING
-                    bad_rows = clean_df[clean_df['State'] == 'Unknown'].index.tolist()
-                    if bad_rows:
-                        # Convert 0-based index to 1-based row number (accounting for header)
-                        row_nums = [x + 2 for x in bad_rows]
-                        st.warning(f"⚠️ **Data Quality Warning:** {len(bad_rows)} rows are missing 'State' data (Excel Rows: {row_nums[:5]}...). Results may be less accurate.")
-                    
-                    st.toast("✅ Hotel(s) added to queue.")
+                    st.toast("✅ Upload Processed")
                 except Exception as e: st.error(f"Error: {e}")
 
         with col_upload:
